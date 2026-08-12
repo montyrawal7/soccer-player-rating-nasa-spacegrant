@@ -78,10 +78,18 @@ To verify that the predictive rating system is statistically sound and doesn't w
 ## **How to Run Locally**
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/montyrawal7/soccer-player-rating-nasa-spacegrant.git
 cd soccer-player-rating-nasa-spacegrant
 python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+
+# Download the public EA FC 26 dataset and build the local database
+python3 download_data.py
+python3 database_init.py
+
+# Run the app
 streamlit run src/app.py
 ```
+
+**Note:** the `data/` folder (containing the raw dataset and SQLite database) is not included in this repo. The two commands above regenerate it locally from a public Hugging Face dataset — no need to request any files.
