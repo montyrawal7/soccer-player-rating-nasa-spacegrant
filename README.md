@@ -1,5 +1,5 @@
 # **Soccer Player Rating App**
-### **NASA New York Space Grant Consortium — Research Initiative (2026–2027)**
+### **NASA New York Space Grant Consortium — Research Initiative (Summer 2026)**
 
 
 
