@@ -191,7 +191,7 @@ model, feature_cols = load_model_and_features()
 df_baseline = load_baseline_stats()
 
 st.sidebar.header("Player Field Inputs")
-player_name = st.sidebar.text_input("Player Name", "Aashish Rawal")
+player_name = st.sidebar.text_input("Player Name", st.session_state.user_name)
 position = st.sidebar.selectbox("Preferred Position", ["Forward", "Midfielder", "Defender"])
 
 st.sidebar.subheader("Player Profile")
