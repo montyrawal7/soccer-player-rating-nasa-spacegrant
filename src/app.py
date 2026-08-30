@@ -1,6 +1,7 @@
 import os
 import json
 import sqlite3
+import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -16,7 +17,49 @@ SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SRC_DIR)
 MODEL_PATH = os.path.join(BASE_DIR, "models", "xgboost_model.json")
 FEATURES_PATH = os.path.join(BASE_DIR, "models", "feature_columns.json")
-DB_PATH = os.path.join(BASE_DIR, "data", "soccer_research.db")
+DATA_DIR = os.path.join(BASE_DIR, "data")
+DB_PATH = os.path.join(DATA_DIR, "soccer_research.db")
+CSV_PATH = os.path.join(DATA_DIR, "ea_fc26_players.csv")
+DATA_URL = "https://huggingface.co/datasets/Kishohar/footballIQ/resolve/main/ea_fc26_players.csv"
+
+
+@st.cache_resource
+def ensure_database_ready():
+    """Build data/soccer_research.db from the public source dataset if it
+    doesn't already exist. This is what lets the app run on a fresh
+    checkout (e.g. Streamlit Community Cloud) where data/ is intentionally
+    excluded from git, instead of requiring the .db file to be shipped in
+    the repo."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    if os.path.exists(DB_PATH):
+        return True
+
+    with st.spinner("First-time setup: downloading and preparing the player database. This can take a minute..."):
+        if not os.path.exists(CSV_PATH):
+            urllib.request.urlretrieve(DATA_URL, CSV_PATH)
+
+        df = pd.read_csv(CSV_PATH)
+        df.columns = df.columns.str.strip().str.lower()
+
+        name_col = next((c for c in ["name", "short_name", "long_name", "player_name"] if c in df.columns), None)
+        age_col = next((c for c in ["age"] if c in df.columns), None)
+        pace_col = next((c for c in ["pace", "pace_total", "sprint_speed"] if c in df.columns), None)
+        dribbling_col = next((c for c in ["dribbling", "dribbling_total"] if c in df.columns), None)
+
+        check_cols = [c for c in [name_col, age_col, pace_col, dribbling_col] if c is not None]
+        if check_cols:
+            df.dropna(subset=check_cols, inplace=True)
+
+        numeric_cols = [c for c in ["pace", "acceleration", "sprint_speed", "strength", "stamina", "agility", "dribbling"] if c in df.columns]
+        for col in numeric_cols:
+            df = df[df[col] > 0]
+
+        conn = sqlite3.connect(DB_PATH)
+        df.to_sql("players", conn, if_exists="replace", index=False)
+        conn.close()
+
+    return True
+
 
 @st.cache_resource
 def load_model_and_features():
@@ -35,6 +78,7 @@ def load_baseline_stats():
 
 
 def init_users_table():
+    os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """
@@ -68,6 +112,7 @@ if not os.path.exists(MODEL_PATH):
     st.error("Model file not found. Please run `python3 src/model_trainer.py` first.")
     st.stop()
 
+ensure_database_ready()
 init_users_table()
 
 # --- Introduction ------------------------------------------------------
