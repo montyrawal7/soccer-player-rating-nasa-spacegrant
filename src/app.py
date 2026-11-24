@@ -1,28 +1,42 @@
 import os
+import html
 import json
 import sqlite3
 import urllib.request
 import numpy as np
 import pandas as pd
 import streamlit as st
-from xgboost import XGBRegressor
-
-st.set_page_config(page_title="Soccer Performance Analytics", page_icon="⚽", layout="wide")
-
+import plotly.graph_objects as go
+from mlp_inference import NumpyMLP
+ 
+from test_guides import PHYSICAL_TESTS, TECHNICAL_TESTS
+ 
+st.set_page_config(
+    page_title="Soccer Performance Analytics",
+    page_icon="⚽",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
+ 
 # Resolve paths relative to the project root (one level up from this file,
 # since app.py lives in src/ while models/ and data/ live at the project
-# root), so `streamlit run app.py` works no matter which folder you launch
-# it from.
+# root), so the app works no matter which folder you launch it from.
 SRC_DIR = os.path.dirname(os.path.abspath(__file__))
 BASE_DIR = os.path.dirname(SRC_DIR)
-MODEL_PATH = os.path.join(BASE_DIR, "models", "xgboost_model.json")
+MODEL_PATH = os.path.join(BASE_DIR, "models", "mlp_model.npz")
 FEATURES_PATH = os.path.join(BASE_DIR, "models", "feature_columns.json")
 DATA_DIR = os.path.join(BASE_DIR, "data")
 DB_PATH = os.path.join(DATA_DIR, "soccer_research.db")
 CSV_PATH = os.path.join(DATA_DIR, "ea_fc26_players.csv")
 DATA_URL = "https://huggingface.co/datasets/Kishohar/footballIQ/resolve/main/ea_fc26_players.csv"
-
-
+ 
+POSITIONS = ["Forward", "Midfielder", "Defender"]
+POSITION_CODE = {"Forward": "ST", "Midfielder": "CM", "Defender": "CB"}
+ 
+ 
+# ---------------------------------------------------------------------------
+# Data and model loading (same logic as before)
+# ---------------------------------------------------------------------------
 @st.cache_resource
 def ensure_database_ready():
     """Build data/soccer_research.db from the public source dataset if it
@@ -33,50 +47,50 @@ def ensure_database_ready():
     os.makedirs(DATA_DIR, exist_ok=True)
     if os.path.exists(DB_PATH):
         return True
-
+ 
     with st.spinner("First-time setup: downloading and preparing the player database. This can take a minute..."):
         if not os.path.exists(CSV_PATH):
             urllib.request.urlretrieve(DATA_URL, CSV_PATH)
-
+ 
         df = pd.read_csv(CSV_PATH)
         df.columns = df.columns.str.strip().str.lower()
-
+ 
         name_col = next((c for c in ["name", "short_name", "long_name", "player_name"] if c in df.columns), None)
         age_col = next((c for c in ["age"] if c in df.columns), None)
         pace_col = next((c for c in ["pace", "pace_total", "sprint_speed"] if c in df.columns), None)
         dribbling_col = next((c for c in ["dribbling", "dribbling_total"] if c in df.columns), None)
-
+ 
         check_cols = [c for c in [name_col, age_col, pace_col, dribbling_col] if c is not None]
         if check_cols:
             df.dropna(subset=check_cols, inplace=True)
-
+ 
         numeric_cols = [c for c in ["pace", "acceleration", "sprint_speed", "strength", "stamina", "agility", "dribbling"] if c in df.columns]
         for col in numeric_cols:
             df = df[df[col] > 0]
-
+ 
         conn = sqlite3.connect(DB_PATH)
         df.to_sql("players", conn, if_exists="replace", index=False)
         conn.close()
-
+ 
     return True
-
-
+ 
+ 
 @st.cache_resource
 def load_model_and_features():
-    model = XGBRegressor()
-    model.load_model(MODEL_PATH)
+    model = NumpyMLP.load(MODEL_PATH)  # PyTorch-trained weights, run with NumPy
     with open(FEATURES_PATH, "r") as f:
         feature_cols = json.load(f)
     return model, feature_cols
-
+ 
+ 
 @st.cache_data
 def load_baseline_stats():
     conn = sqlite3.connect(DB_PATH)
     df = pd.read_sql_query("SELECT * FROM players;", conn)
     conn.close()
     return df
-
-
+ 
+ 
 def init_users_table():
     os.makedirs(DATA_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
@@ -93,8 +107,8 @@ def init_users_table():
     )
     conn.commit()
     conn.close()
-
-
+ 
+ 
 def save_user(name, email, phone):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
@@ -103,74 +117,226 @@ def save_user(name, email, phone):
     )
     conn.commit()
     conn.close()
-
-
-st.title("⚽ Multi-Modal Soccer Performance Analytics Framework")
-st.subheader("NASA New York Space Grant Consortium — Research Initiative (2026–2027)")
-
-if not os.path.exists(MODEL_PATH):
-    st.error("Model file not found. Please run `python3 src/model_trainer.py` first.")
-    st.stop()
-
-ensure_database_ready()
-init_users_table()
-
-# --- Introduction ------------------------------------------------------
-st.markdown(
-    """
-### What is this?
-
-Most amateur and youth soccer players have no real way to know how their
-speed, strength, or technical ability actually compares to a professional
-athlete — so ratings players give themselves tend to be guesses, not
-measurements.
-
-**This app fixes that.** It's a free tool — no subscription, no paywall —
-that lets you:
-
-1. **Learn how to test yourself properly.** Every physical test below
-   comes with a short explanation and a link to a real, standardized
-   testing protocol (the same kind used in professional combines), so
-   you're measuring yourself the right way before you enter anything.
-2. **Enter your own results.** Sprint time, agility, strength, and your
-   own technical self-ratings.
-3. **See exactly where you stand.** Your numbers are compared directly
-   against a database of **16,228 real professional players** (EA Sports
-   FC 26 ratings data), filtered to your specific position, so a
-   defender is compared to pro defenders and a forward to pro forwards —
-   not to an unrelated average.
-
-The result is an honest, data-driven snapshot of your current athletic
-standing — not an inflated self-rating, and not a generic average, but
-a real comparison against the level you're ultimately trying to reach.
-
-*This tool is part of an ongoing NASA New York Space Grant Consortium
-research project conducted through Cornell University and Queensborough
-Community College (QCC). Your test results and profile information help
-support that research.*
+ 
+ 
+# ---------------------------------------------------------------------------
+# Turning the form answers into the model's input row (same logic as before)
+# ---------------------------------------------------------------------------
+def clamp(value, lo=30.0, hi=99.0):
+    return max(lo, min(hi, value))
+ 
+ 
+def rating_from_time(seconds, best_time, worst_time):
+    """Faster (lower) time -> higher rating. Linearly interpolates between
+    a recreational-level time (worst_time -> 30) and an elite time
+    (best_time -> 99)."""
+    span = worst_time - best_time
+    scaled = 99.0 - (seconds - best_time) * (69.0 / span)
+    return clamp(scaled)
+ 
+ 
+def rating_from_reps(reps, min_reps, max_reps):
+    span = max_reps - min_reps
+    scaled = 30.0 + (reps - min_reps) * (69.0 / span)
+    return clamp(scaled)
+ 
+ 
+# technical answer -> the model column(s) it fills in
+TECHNICAL_TO_COLUMNS = {
+    "finishing": ["finishing"],
+    "shotpower": ["shotpower", "volleys"],
+    "passing": ["shortpassing", "longpassing"],
+    "ballcontrol": ["ballcontrol"],
+    "vision": ["vision"],
+    "standingtackle": ["standingtackle"],
+    "slidingtackle": ["slidingtackle"],
+    "interceptions": ["interceptions"],
+    "physical": ["strength", "aggression"],
+    "dribbling": ["dribbling"],
+    "longshots": ["longshots"],
+    "positioning": ["positioning"],
+    "headingaccuracy": ["headingaccuracy"],
+    "curve": ["curve"],
+    "penalties": ["penalties"],
+    "crossing": ["crossing"],
+    "freekickaccuracy": ["freekickaccuracy"],
+    "composure": ["composure"],
+    "stamina": ["stamina"],
+    "jumping": ["jumping"],
+    "defensiveawareness": ["defensiveawareness"],
+}
+ 
+COMPOSITE_SOURCES = {
+    "pac": ["acceleration", "sprintspeed"],
+    "dri": ["dribbling", "ballcontrol", "agility", "balance"],
+    "pas": ["shortpassing", "longpassing", "vision"],
+    "sho": ["finishing", "shotpower", "volleys", "longshots", "penalties"],
+    "def": ["standingtackle", "slidingtackle", "interceptions", "defensiveawareness"],
+    "phy": ["strength", "stamina", "aggression", "jumping"],
+}
+ 
+CATEGORY_LABELS = {
+    "pac": "Pace",
+    "dri": "Dribbling",
+    "pas": "Passing",
+    "sho": "Shooting",
+    "def": "Defending",
+    "phy": "Physical",
+}
+ 
+ 
+def build_input_row(answers, position, df_position, feature_cols):
+    """Start every feature at the position-specific baseline mean, then
+    overwrite the ones the user actually answered. Returns the filled-in
+    dict and the set of model columns the user's answers touched."""
+    input_dict = {col: float(df_position[col].mean()) for col in feature_cols}
+    touched = set()
+ 
+    def put(col, value):
+        if col in input_dict:
+            input_dict[col] = float(value)
+            touched.add(col)
+ 
+    # Profile (note: "age" is not a model feature, so it is display-only)
+    put("height", answers["height"])
+    put("weight", answers["weight"])
+    put("weakfootability", answers["weakfoot"])
+    put("skillmoves", answers["skillmoves"])
+ 
+    # Physical tests
+    sprint_rating = rating_from_time(answers["sprint_time"], best_time=3.5, worst_time=6.0)
+    shuttle_rating = rating_from_time(answers["shuttle_time"], best_time=4.0, worst_time=7.0)
+    strength_rating = rating_from_reps(answers["bench_reps"], min_reps=0, max_reps=30)
+    for col in ("acceleration", "sprintspeed"):
+        put(col, sprint_rating)
+    for col in ("agility", "balance", "reactions"):
+        put(col, shuttle_rating)
+    put("strength", strength_rating)
+ 
+    # Technical ratings (only the ones asked for this position are in answers)
+    for key, columns in TECHNICAL_TO_COLUMNS.items():
+        if key in answers:
+            for col in columns:
+                put(col, answers[key])
+ 
+    # Keep the six category columns consistent with the detail columns
+    for composite_col, source_cols in COMPOSITE_SOURCES.items():
+        present = [c for c in source_cols if c in input_dict]
+        if composite_col in input_dict and present:
+            input_dict[composite_col] = float(np.mean([input_dict[c] for c in present]))
+ 
+    return input_dict, touched
+ 
+ 
+# ---------------------------------------------------------------------------
+# Look and feel
+# ---------------------------------------------------------------------------
+CSS = """
+<style>
+.block-container { padding-top: 2.2rem; max-width: 760px; }
+.eyebrow { color:#4ade80; font-size:0.78rem; letter-spacing:0.12em; text-transform:uppercase; font-weight:600; }
+.hero-title { font-size:2.5rem; font-weight:800; line-height:1.1; margin:0.2rem 0 0.6rem 0; }
+.hero-sub { color:#b6d4c1; font-size:1.05rem; margin-bottom:1.2rem; }
+.how-card { background:#12301f; border:1px solid #1f5136; border-radius:14px; padding:0.9rem 1rem; height:100%; margin-bottom:0.9rem; }
+.how-card b { color:#4ade80; }
+.rating-card { background:linear-gradient(135deg,#14452a 0%,#0d2a1a 100%); border:1px solid #2a6b44;
+  border-radius:18px; padding:1.6rem 1rem; text-align:center; margin:0.6rem 0 0.8rem 0; }
+.rating-big { font-size:4.2rem; font-weight:800; color:#4ade80; line-height:1; }
+.rating-big span { font-size:1.4rem; color:#86c9a0; font-weight:600; }
+.rating-label { color:#b6d4c1; text-transform:uppercase; letter-spacing:0.1em; font-size:0.78rem; margin-bottom:0.4rem; }
+.rating-note { color:#e8f5ec; margin-top:0.7rem; font-size:1.02rem; }
+.chip { display:inline-block; background:#12301f; border:1px solid #1f5136; color:#b6d4c1;
+  border-radius:999px; padding:0.15rem 0.7rem; font-size:0.85rem; margin-right:0.4rem; }
+.mini-card { border-radius:14px; padding:0.8rem 1rem; margin-bottom:0.5rem; border:1px solid #1f5136; background:#12301f; }
+.mini-card.gap { border-color:#6b4a1f; background:#2a2012; }
+.mini-card .t { font-weight:700; }
+.mini-card .s { color:#b6d4c1; font-size:0.92rem; }
+ .tile-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(105px, 1fr)); gap:0.55rem; margin:0.3rem 0 0.8rem 0; }
+.tile { border-radius:12px; padding:0.6rem 0.5rem; text-align:center; border:1px solid #1f5136; background:#12301f; }
+.tile.down { border-color:#6b4a1f; background:#2a2012; }
+.tile .tl { color:#b6d4c1; font-size:0.72rem; letter-spacing:0.08em; text-transform:uppercase; }
+.tile .tv { font-size:1.9rem; font-weight:800; line-height:1.15; color:#4ade80; }
+.tile.down .tv { color:#f0b35a; }
+.tile .tp { color:#8fb3a0; font-size:0.78rem; }
+.fine { color:#8fb3a0; font-size:0.85rem; }
+div[data-testid="stFormSubmitButton"], div[data-testid="stButton"] { width:100%; }
+div[data-testid="stFormSubmitButton"] button, div[data-testid="stButton"] button,
+[data-testid^="stBaseButton-"] { width:100%; }
+div[data-testid="stForm"] { border:1px solid #1f5136; border-radius:16px; padding:1.2rem; }
+</style>
 """
-)
-st.divider()
-
-# --- Signup gate -----------------------------------------------------------
-# NOTE FOR RESEARCHER: this form collects name/email/phone from real people.
-# Before deploying this publicly, confirm with your research advisor whether
-# this requires IRB review / informed consent as part of your Space Grant
-# project, since it involves collecting personally identifiable information
-# from human participants.
-if "signed_up" not in st.session_state:
-    st.session_state.signed_up = False
-    st.session_state.user_name = ""
-
-if not st.session_state.signed_up:
-    st.info("Sign up to get your personalized talent rating and benchmark comparison.")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Session state helpers
+# ---------------------------------------------------------------------------
+def init_state():
+    defaults = {
+        "page": "welcome",     # welcome -> form -> results
+        "answers": {},
+        "user_name": "",
+        "signed_up": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+ 
+ 
+def goto(page):
+    st.session_state.page = page
+    st.rerun()
+ 
+ 
+def start_over():
+    st.session_state.answers = {}
+    goto("form")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Page 1: welcome + sign-up
+# ---------------------------------------------------------------------------
+def render_welcome():
+    st.markdown(
+        """
+        <div class="eyebrow">Multi-Modal Soccer Performance Analytics Framework</div>
+        <div class="hero-title">Where do you really stand?</div>
+        <div class="hero-sub">Test yourself the right way, enter your results, and see how you compare
+        with 16,228 professional players at your position. Free, no paywall.</div>
+        """,
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3 = st.columns(3)
+    c1.markdown('<div class="how-card"><b>1. Learn the tests</b><br>Short, standard protocols for each skill, so you measure instead of guess.</div>', unsafe_allow_html=True)
+    c2.markdown('<div class="how-card"><b>2. Fill in one form</b><br>Pick your position and rate yourself on the tests shown for it.</div>', unsafe_allow_html=True)
+    c3.markdown('<div class="how-card"><b>3. See your results</b><br>Your rating, a chart against pros, and your strengths and gaps.</div>', unsafe_allow_html=True)
+ 
+    with st.expander("About this research project"):
+        st.markdown(
+            "This tool is part of an ongoing NASA New York Space Grant Consortium "
+            "research project conducted through Cornell University and Queensborough "
+            "Community College (QCC). Your test results and profile information help "
+            "support that research.\n\n"
+            "Most amateur and youth players have no real way to know how their speed, "
+            "strength, or technical ability compares to a professional, so the ratings "
+            "players give themselves tend to be guesses. Here, your numbers are compared "
+            "with EA Sports FC 26 ratings for professionals, filtered to your position, so "
+            "a defender is compared with pro defenders and a forward with pro forwards."
+        )
+ 
+    st.write("")
+    # NOTE FOR RESEARCHER: this form collects name/email/phone from real people.
+    # Before deploying this publicly, confirm with your research advisor whether
+    # this requires IRB review / informed consent as part of your Space Grant
+    # project, since it involves collecting personally identifiable information
+    # from human participants.
+    st.markdown("#### Sign up to get started")
     with st.form("signup_form"):
         su_name = st.text_input("Full Name")
         su_email = st.text_input("Email")
         su_phone = st.text_input("Phone Number (optional)")
         agree = st.checkbox("I agree to have my submitted test data stored for this research project.")
-        submitted = st.form_submit_button("Sign Up")
-
+        submitted = st.form_submit_button("Sign Up and Start", type="primary")
+ 
         if submitted:
             if not su_name.strip() or not su_email.strip():
                 st.error("Name and email are required.")
@@ -182,677 +348,275 @@ if not st.session_state.signed_up:
                 save_user(su_name.strip(), su_email.strip(), su_phone.strip())
                 st.session_state.signed_up = True
                 st.session_state.user_name = su_name.strip()
-                st.rerun()
+                st.session_state.answers = {"name": su_name.strip()}
+                goto("form")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Page 2: the input form (one page; the position choice reveals its attributes)
+# ---------------------------------------------------------------------------
+def guide_box(item):
+    if item.get("guide_md"):
+        with st.expander(item["guide_title"]):
+            st.markdown(item["guide_md"])
+ 
+ 
+def number_or_slider(item, answers, key_prefix):
+    default = answers.get(item["key"], item["default"])
+    kwargs = {}
+    if item.get("step") is not None:
+        kwargs["step"] = item["step"]
+    return st.slider(
+        item["label"], item["min"], item["max"], default,
+        key=f"{key_prefix}_{item['key']}", **kwargs,
+    )
+ 
+ 
+def render_form():
+    answers = st.session_state.answers
+ 
+    st.markdown('<div class="eyebrow">Your details</div>', unsafe_allow_html=True)
+    st.markdown("### Tell us about you")
+ 
+    # Name and position sit OUTSIDE the form on purpose: that way, choosing a
+    # position instantly shows that position's attributes below.
+    name = st.text_input("Player Name", answers.get("name", st.session_state.user_name), key="f_name")
+    pos_default = POSITIONS.index(answers["position"]) if answers.get("position") in POSITIONS else 0
+    position = st.selectbox("Preferred Position", POSITIONS, index=pos_default, key="f_position")
+    # Earlier answers only count for the same position, so another position's
+    # attributes can never leak into this one's rating.
+    prev = answers if answers.get("position") == position else {}
+ 
+    with st.form("player_form"):
+        st.markdown("#### Profile")
+        c1, c2, c3 = st.columns(3)
+        age = c1.number_input("Age", min_value=14, max_value=45, value=int(prev.get("age", 17)), step=1, key="f_age")
+        height = c2.number_input("Height (cm)", min_value=140, max_value=210, value=int(prev.get("height", 175)), step=1, key="f_height")
+        weight = c3.number_input("Weight (kg)", min_value=40, max_value=110, value=int(prev.get("weight", 68)), step=1, key="f_weight")
+        c4, c5 = st.columns(2)
+        weakfoot = c4.select_slider("Weak Foot Ability (1-5 stars)", options=[1, 2, 3, 4, 5], value=prev.get("weakfoot", 3), key="f_weakfoot")
+        skillmoves = c5.select_slider("Skill Moves (1-5 stars)", options=[1, 2, 3, 4, 5], value=prev.get("skillmoves", 3), key="f_skillmoves")
+ 
+        st.markdown("#### Physical tests")
+        st.caption("Open the box above each slider to see exactly how to run the test. Use your real result.")
+        physical_values = {}
+        for item in PHYSICAL_TESTS:
+            guide_box(item)
+            physical_values[item["key"]] = number_or_slider(item, prev, "f")
+ 
+        st.markdown(f"#### {position} technical ratings")
+        st.caption(
+            "These change with your position, since a striker's shot power and a "
+            "center-back's tackling aren't measuring the same thing. Open the box above "
+            "each slider for a test you can use to rate yourself."
+        )
+        technical_values = {}
+        tech_items = TECHNICAL_TESTS[position]
+        for i in range(0, len(tech_items), 2):
+            row = st.columns(2)           # two attributes side by side (stacks on phones)
+            for col, item in zip(row, tech_items[i:i + 2]):
+                with col:
+                    guide_box(item)
+                    technical_values[item["key"]] = number_or_slider(item, prev, f"f_{position}")
+ 
+        submitted = st.form_submit_button("Get my rating →", type="primary")
+ 
+    if submitted:
+        # Start a fresh answer set so only this position's answers are kept.
+        st.session_state.answers = {
+            "name": name.strip() or st.session_state.user_name,
+            "position": position, "age": age, "height": height, "weight": weight,
+            "weakfoot": weakfoot, "skillmoves": skillmoves,
+            **physical_values, **technical_values,
+        }
+        goto("results")
+ 
+ 
+# ---------------------------------------------------------------------------
+# Page 3: results
+# ---------------------------------------------------------------------------
+def radar_chart(user_vals, pro_vals, labels):
+    theta = labels + labels[:1]
+    fig = go.Figure()
+    fig.add_trace(go.Scatterpolar(
+        r=pro_vals + pro_vals[:1], theta=theta, name="Pro average",
+        line=dict(color="#8fb3a0", width=2, dash="dot"), fill="toself",
+        fillcolor="rgba(143,179,160,0.12)",
+    ))
+    fig.add_trace(go.Scatterpolar(
+        r=user_vals + user_vals[:1], theta=theta, name="You",
+        line=dict(color="#4ade80", width=3), fill="toself",
+        fillcolor="rgba(74,222,128,0.30)",
+    ))
+    fig.update_layout(
+        polar=dict(
+            bgcolor="rgba(0,0,0,0)",
+            radialaxis=dict(range=[20, 100], showticklabels=True, tickfont=dict(color="#8fb3a0", size=10),
+                            gridcolor="#1f5136", linecolor="#1f5136"),
+            angularaxis=dict(tickfont=dict(color="#e8f5ec", size=13), gridcolor="#1f5136", linecolor="#1f5136"),
+        ),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e8f5ec"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.15, xanchor="center", x=0.5),
+        margin=dict(l=75, r=75, t=20, b=40), height=380,
+    )
+    return fig
+ 
+ 
+def render_results():
+    answers = st.session_state.answers
+    position = answers["position"]
+    name = answers.get("name") or st.session_state.user_name or "Player"
+ 
+    model, feature_cols = load_model_and_features()
+    df_baseline = load_baseline_stats()
+    df_position = df_baseline[df_baseline.get("position", pd.Series(dtype=str)) == POSITION_CODE[position]]
+    if df_position.empty:
+        df_position = df_baseline  # fallback if position labels don't match the DB
+ 
+    input_dict, touched = build_input_row(answers, position, df_position, feature_cols)
+    input_df = pd.DataFrame([input_dict])[feature_cols]
+    predicted_rating = float(np.clip(model.predict(input_df)[0], 1, 99))
+ 
+    pos_ratings = df_position["overallrating"]
+    pro_avg = float(pos_ratings.mean())
+    percentile = float((pos_ratings < predicted_rating).mean() * 100)
+ 
+    safe_name = html.escape(name)
+    st.markdown(
+        f'<div class="eyebrow">Your results</div>'
+        f'<div class="hero-title" style="font-size:2rem">{safe_name}</div>'
+        f'<span class="chip">{position}</span><span class="chip">Age {int(answers["age"])}</span>',
+        unsafe_allow_html=True,
+    )
+ 
+    if percentile >= 1:
+        note = f"Higher than <b>{percentile:.0f}%</b> of pro {position.lower()}s in the database."
+    else:
+        note = (f"Every pro {position.lower()} in the database is rated higher. "
+                "Most players start well below pro level, and that gap is what you can train.")
+    st.markdown(
+        f'<div class="rating-card"><div class="rating-label">Predicted talent rating</div>'
+        f'<div class="rating-big">{predicted_rating:.1f}<span> / 99</span></div>'
+        f'<div class="rating-note">{note}</div>'
+        f'<div class="fine" style="margin-top:0.4rem">Pro {position.lower()} average: {pro_avg:.1f}</div></div>',
+        unsafe_allow_html=True,
+    )
+ 
+    # --- category comparison -------------------------------------------------
+    cats = list(CATEGORY_LABELS)
+    labels = [CATEGORY_LABELS[c] for c in cats]
+    user_vals = [float(input_dict[c]) for c in cats if c in input_dict]
+    pro_vals = [float(df_position[c].mean()) for c in cats if c in df_position.columns]
+    if len(user_vals) == len(cats) and len(pro_vals) == len(cats):
+        st.markdown("#### Your numbers vs. the pro average")
+        tiles = ""
+        for c, label, you, pro in zip(cats, labels, user_vals, pro_vals):
+            state = "up" if you >= pro else "down"
+            tiles += (f'<div class="tile {state}"><div class="tl">{label}</div>'
+                      f'<div class="tv">{you:.0f}</div><div class="tp">pro avg {pro:.0f}</div></div>')
+        st.markdown(f'<div class="tile-grid">{tiles}</div>', unsafe_allow_html=True)
+        st.plotly_chart(radar_chart(user_vals, pro_vals, labels),
+                        config={"displayModeBar": False})
+        st.caption("Categories you didn't enter anything for sit at the pro average for your position.")
+ 
+        # strengths and gaps (only categories the user's answers actually touched)
+        rows = []
+        for c in cats:
+            sources = COMPOSITE_SOURCES[c]
+            if not any(s in touched for s in sources):
+                continue
+            std = float(df_position[c].std())
+            z = (float(input_dict[c]) - float(df_position[c].mean())) / std if std > 0 else 0.0
+            rows.append((CATEGORY_LABELS[c], z, float(input_dict[c]), float(df_position[c].mean())))
+        rows.sort(key=lambda r: r[1], reverse=True)
+ 
+        if len(rows) >= 2:
+            st.markdown("#### Your strengths and biggest gaps")
+            left, right = st.columns(2)
+            with left:
+                st.markdown("**Closest to pro level**")
+                for label, z, you, pro in rows[:2]:
+                    st.markdown(f'<div class="mini-card"><div class="t">{label}</div>'
+                                f'<div class="s">You {you:.0f} · pro average {pro:.0f}</div></div>',
+                                unsafe_allow_html=True)
+            with right:
+                st.markdown("**Furthest from pro level**")
+                for label, z, you, pro in rows[::-1][:2]:
+                    st.markdown(f'<div class="mini-card gap"><div class="t">{label}</div>'
+                                f'<div class="s">You {you:.0f} · pro average {pro:.0f}</div></div>',
+                                unsafe_allow_html=True)
+ 
+    st.markdown(
+        '<div class="fine" style="margin:0.8rem 0 0.8rem 0">This is an estimate that compares your self-reported results with EA Sports FC 26 '
+        'ratings of professional players. It is not a measure of your real ability.</div>',
+        unsafe_allow_html=True,
+    )
+ 
+    # --- the detailed numbers, tucked away ----------------------------------
+    with st.expander("See the numbers"):
+        zscore_features = {
+            "Overall (Predicted)": ("overallrating", predicted_rating),
+            "Pace": ("pac", input_dict.get("pac")),
+            "Dribbling": ("dri", input_dict.get("dri")),
+            "Passing": ("pas", input_dict.get("pas")),
+            "Shooting": ("sho", input_dict.get("sho")),
+            "Defending": ("def", input_dict.get("def")),
+            "Physical": ("phy", input_dict.get("phy")),
+            "Height (cm)": ("height", input_dict.get("height")),
+            "Weight (kg)": ("weight", input_dict.get("weight")),
+        }
+        zrows = []
+        for label, (col, user_value) in zscore_features.items():
+            if col not in df_position.columns or user_value is None:
+                continue
+            pos_mean = df_position[col].mean()
+            pos_std = df_position[col].std()
+            z = (user_value - pos_mean) / pos_std if pos_std > 0 else 0.0
+            zrows.append({"Attribute": label, "Your Value": round(user_value, 1),
+                          "Position Avg": round(pos_mean, 1), "Z-Score": round(z, 2)})
+        zscore_df = pd.DataFrame(zrows).set_index("Attribute")
+        st.caption(
+            "A Z-score shows how many standard deviations above or below the position average "
+            "you fall. 0 = exactly average, +1 = one above, -1 = one below."
+        )
+        st.dataframe(zscore_df)
+        st.write(f"**{position} baselines (n={len(df_position)})**")
+        st.dataframe(df_position[["overallrating", "height", "weight"]].describe().T[["mean", "std", "min", "max"]])
+        st.write("**Overall rating distribution of all 16,228 pros**")
+        st.bar_chart(df_baseline["overallrating"].value_counts().sort_index())
+ 
+    st.write("")
+    b1, b2 = st.columns(2)
+    if b1.button("← Edit my answers"):
+        goto("form")
+    if b2.button("Start over"):
+        start_over()
+ 
+ 
+# ---------------------------------------------------------------------------
+# App entry point
+# ---------------------------------------------------------------------------
+st.markdown(CSS, unsafe_allow_html=True)
+ 
+if not os.path.exists(MODEL_PATH):
+    st.error("Model file not found. Please run `python3 src/model_trainer.py` first.")
     st.stop()
-
-st.success(f"Welcome, {st.session_state.user_name}! Fill out your field test results in the sidebar.")
-
-model, feature_cols = load_model_and_features()
-df_baseline = load_baseline_stats()
-
-st.sidebar.header("Player Field Inputs")
-player_name = st.sidebar.text_input("Player Name", st.session_state.user_name)
-position = st.sidebar.selectbox("Preferred Position", ["Forward", "Midfielder", "Defender"])
-
-st.sidebar.subheader("Player Profile")
-age_in = st.sidebar.number_input("Age", min_value=14, max_value=45, value=17, step=1)
-height_in = st.sidebar.number_input("Height (cm)", min_value=140, max_value=210, value=175, step=1)
-weight_in = st.sidebar.number_input("Weight (kg)", min_value=40, max_value=110, value=68, step=1)
-weakfoot_in = st.sidebar.select_slider("Weak Foot Ability (1-5 stars)", options=[1, 2, 3, 4, 5], value=3)
-skillmoves_in = st.sidebar.select_slider("Skill Moves (1-5 stars)", options=[1, 2, 3, 4, 5], value=3)
-
-st.sidebar.subheader("Physical Tests")
-
-with st.sidebar.expander("❓ How do I time my 30m sprint?"):
-    st.markdown(
-        "**Setup:** mark a straight, flat 30m stretch with two cones "
-        "(start and finish). Warm up first with light jogging and a few "
-        "practice accelerations.\n\n"
-        "**How to run it:** start from a stationary position, sprint "
-        "maximally through the finish cone (don't slow down before it), "
-        "and have a partner time you with a stopwatch from your first "
-        "movement to when you cross the line. Run it twice and record "
-        "your best time.\n\n"
-        "[Full protocol — Topend Sports](https://www.topendsports.com/testing/tests/sprint-30meters.htm)"
-    )
-sprint_time = st.sidebar.slider("30m Sprint Time (seconds)", 3.5, 6.0, 4.2, 0.1)
-
-with st.sidebar.expander("❓ How do I run the 5-10-5 shuttle?"):
-    st.markdown(
-        "**Setup:** place 3 cones in a straight line, 5 yards apart "
-        "(so 10 yards total between the outer two).\n\n"
-        "**How to run it:** start straddling the middle cone in a "
-        "3-point stance. Sprint 5 yards to one side and touch the line, "
-        "change direction and sprint 10 yards to the far cone and touch "
-        "it, then sprint back 5 yards through the middle cone to finish. "
-        "Time starts on your first movement and stops when you cross "
-        "the middle cone at the end.\n\n"
-        "[Full protocol — Science for Sport](https://www.scienceforsport.com/pro-agility-5-10-5-test/) · "
-        "[Video walkthrough](https://www.youtube.com/watch?v=tYhCJd7LaBU)"
-    )
-shuttle_time = st.sidebar.slider("5-10-5 Shuttle Time (seconds)", 4.0, 7.0, 4.8, 0.1)
-
-with st.sidebar.expander("❓ How do I test max bench press reps?"):
-    st.markdown(
-        "**Setup:** standard barbell + 135 lbs loaded, bench with a "
-        "spotter present. **Always use a spotter for this test.**\n\n"
-        "**How to run it:** lie flat, grip the bar shoulder-width apart, "
-        "lower it to your chest with control, then press to full elbow "
-        "extension. That's 1 rep. Repeat with proper form until you "
-        "can't complete another full rep — that count is your score.\n\n"
-        "[Full protocol — Topend Sports](https://www.topendsports.com/testing/tests/max-bench-press.htm)"
-    )
-bench_reps = st.sidebar.slider("Max Bench Press Reps (135 lbs)", 0, 30, 12)
-
-st.sidebar.subheader(f"{position}-Specific Technical Ratings")
-st.sidebar.caption(
-    "These change based on your selected position, since a striker's "
-    "shot power and a center-back's tackling aren't measuring the same "
-    "thing. More attributes will be added per position over time."
-)
-
-# Reset all technical inputs each run; only the branch matching the
-# selected position actually gets set, everything else stays None and
-# falls back to the position-average baseline further down.
-finishing_in = shotpower_in = None
-passing_in = ballcontrol_in = vision_in = None
-standingtackle_in = slidingtackle_in = interceptions_in = physical_in = None
-dribbling_in = longshots_in = positioning_in = headingaccuracy_in = None
-curve_in = penalties_in = crossing_in = freekickaccuracy_in = None
-composure_in = stamina_in = jumping_in = defensiveawareness_in = None
-
-if position == "Forward":
-    with st.sidebar.expander("❓ How do I rate my Finishing (Shot Accuracy)?"):
-        st.markdown(
-            "**Objective anchor:** take 10 shots at a goal (or a target "
-            "on a wall) from 12-18 yards, varying angle and pace of "
-            "service. Count how many go exactly where you intended, "
-            "not just 'on target.'\n\n"
-            "- **2-3/10 on target, poor placement control** → rate **30-45**\n"
-            "- **4-6/10, decent placement but inconsistent under pressure** → rate **45-65**\n"
-            "- **7-8/10, reliable placement, both feet usable** → rate **65-80**\n"
-            "- **9-10/10 consistently, clinical under pressure/1st touch finishes** → rate **80+**"
-        )
-    finishing_in = st.sidebar.slider("Finishing (Shot Accuracy)", 30, 99, 68)
-
-    with st.sidebar.expander("❓ How do I rate my Shot Power?"):
-        st.markdown(
-            "**Objective anchor — ball speed.** If you have access to a "
-            "radar/speed gun app, real-world shot speeds break down "
-            "roughly like this:\n\n"
-            "- **Youth/U12: ~30-40 mph** → rate **30-45**\n"
-            "- **Amateur/recreational adult: ~40-55 mph** → rate **45-60**\n"
-            "- **Competitive club/high school: ~55-65 mph** → rate **60-70**\n"
-            "- **Strong amateur/college level: ~65-70 mph** → rate **70-80**\n"
-            "- **Professional average: ~70-80 mph** → rate **80-90**\n"
-            "- **Elite pro / top strikers: 80mph+** → rate **90+**\n\n"
-            "**No radar gun?** Rate how hard you're able to strike it "
-            "while still keeping the shot on target — raw power that "
-            "sends the ball wildly off target isn't useful power.\n\n"
-            "[Shot speed research](https://www.frontiersin.org/journals/sports-and-active-living/articles/10.3389/fspor.2026.1766063/full) · "
-            "[Pro vs. amateur benchmarks](https://stmichaelssoccer.com/rules-rocketing-shots-how-fast-are-soccer-shots/)"
-        )
-    shotpower_in = st.sidebar.slider("Shot Power", 30, 99, 68)
-
-    with st.sidebar.expander("❓ How do I rate my Dribbling?"):
-        st.markdown(
-            "**Objective anchor — cone weave drill.** Set up 5-6 cones "
-            "5 yards apart, weave through with both feet, staying tight.\n\n"
-            "- **12-15+ sec, frequent loss of control** → rate **30-45**\n"
-            "- **8-10 sec, occasional wide touches** → rate **45-60**\n"
-            "- **Under 8 sec, tight touches, comfortable both feet** → rate **60-75**\n"
-            "- **Fast, tight, beats real defenders 1v1 in games** → rate **75-90**\n\n"
-            "[Cone drill benchmarks](https://goalnyx.com/soccer-cone-drills-for-ball-control/)"
-        )
-    dribbling_in = st.sidebar.slider("Dribbling", 30, 99, 68)
-
-    with st.sidebar.expander("❓ How do I rate my Long Shots?"):
-        st.markdown(
-            "**Objective anchor:** take 10 shots from 25+ yards at a "
-            "goal or wall target. Count how many stay on target (not "
-            "just how many would be goals).\n\n"
-            "- **0-2/10 on target** → rate **30-45**\n"
-            "- **3-5/10 on target** → rate **45-65**\n"
-            "- **6-8/10 on target, decent placement from distance** → rate **65-80**\n"
-            "- **9-10/10, genuine threat from distance** → rate **80+**"
-        )
-    longshots_in = st.sidebar.slider("Long Shots", 30, 99, 60)
-
-    with st.sidebar.expander("❓ How do I rate my Positioning?"):
-        st.markdown(
-            "Positioning is about *where you are before the ball "
-            "arrives*, so it's hard to time-test — use this checklist "
-            "from your last few games instead:\n\n"
-            "- I regularly get goal-scoring chances without needing to dribble past multiple defenders first\n"
-            "- I time my runs to beat the offside line rather than getting caught level or behind\n"
-            "- Coaches/teammates say I find space well in the box\n"
-            "- I get more shots per game than most attacking teammates\n"
-            "- I react quickly to loose balls/rebounds in the box\n\n"
-            "**0-1 true** → rate **30-50** · **2-3 true** → rate **50-70** · "
-            "**4-5 true, consistently** → rate **70-90**"
-        )
-    positioning_in = st.sidebar.slider("Positioning", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Heading Accuracy?"):
-        st.markdown(
-            "**Objective anchor — aerial duel win rate.** Over a few "
-            "games or crossing/heading drills, track contested headers "
-            "won vs. attempted.\n\n"
-            "- **Under 40% win rate** → rate **30-50**\n"
-            "- **40-55% win rate** → rate **50-65**\n"
-            "- **55-70% win rate** → rate **65-80**\n"
-            "- **70%+ win rate (above pro top-flight average of ~66%)** → rate **80+**\n\n"
-            "[Aerial duel benchmarks](https://www.athletepath.com/soccer-aerial-duel-calculator/)"
-        )
-    headingaccuracy_in = st.sidebar.slider("Heading Accuracy", 30, 99, 60)
-
-    with st.sidebar.expander("❓ How do I rate my Curve?"):
-        st.markdown(
-            "**Objective anchor:** from the corner of the 18-yard box, "
-            "try to bend 10 shots around an obstacle (a cone or bag "
-            "placed between you and the goal) and on target.\n\n"
-            "- **0-2/10 successfully bent on target** → rate **30-50**\n"
-            "- **3-5/10** → rate **50-65**\n"
-            "- **6-8/10, reliable curl on both power and placed shots** → rate **65-80**\n"
-            "- **9-10/10, can consistently shape shots around a wall/defender** → rate **80+**"
-        )
-    curve_in = st.sidebar.slider("Curve", 30, 99, 55)
-
-    with st.sidebar.expander("❓ How do I rate my Penalties?"):
-        st.markdown(
-            "**Objective anchor — conversion rate.** Track your last 10 "
-            "penalty attempts (practice counts, but game penalties are "
-            "more representative since nerves are part of the skill).\n\n"
-            "- **Under 50% scored** → rate **30-50**\n"
-            "- **50-65% scored** → rate **50-65**\n"
-            "- **65-80% scored (near pro average of ~76-85% in regular play)** → rate **65-85**\n"
-            "- **85%+ scored, consistently composed** → rate **85+**\n\n"
-            "[Pro penalty conversion data](https://www.athletepath.com/soccer-penalty-conversion-calculator/)"
-        )
-    penalties_in = st.sidebar.slider("Penalties", 30, 99, 60)
-
-    with st.sidebar.expander("❓ How do I rate my Crossing?"):
-        st.markdown(
-            "Mainly relevant if you play wide. **Objective anchor:** "
-            "deliver 10 crosses from the flank into the box aimed at a "
-            "target (cone, teammate, or marked zone).\n\n"
-            "- **0-2/10 reach the target zone** → rate **30-50**\n"
-            "- **3-5/10** → rate **50-65**\n"
-            "- **6-8/10, consistent delivery, good pace on the ball** → rate **65-80**\n"
-            "- **9-10/10, reliably picks out a specific target** → rate **80+**"
-        )
-    crossing_in = st.sidebar.slider("Crossing", 30, 99, 55)
-
-elif position == "Midfielder":
-    with st.sidebar.expander("❓ How do I rate my Passing Accuracy?"):
-        st.markdown(
-            "**Objective anchor — wall pass test.** Stand 5-8 yards from "
-            "a flat wall, pass with the inside of your foot, control the "
-            "rebound with one touch, pass again. Do 100 total attempts "
-            "(50 per foot), count clean/accurate returns.\n\n"
-            "- **Under 50/100 clean** → rate **30-45**\n"
-            "- **50-70/100 clean** → rate **45-60**\n"
-            "- **70-85/100 clean** → rate **60-75**\n"
-            "- **85-95/100 clean, solid weak foot too** → rate **75-88**\n"
-            "- **95+/100 clean, minimal foot difference** → rate **88+**\n\n"
-            "**Context:** professional teams complete roughly **77-82%** "
-            "of all passes in matches (with defensive pressure), and "
-            "**90-95%** on simple ground passes. Since a wall drill has "
-            "no defender, aim well above match-pressure rates to justify "
-            "a top-tier score.\n\n"
-            "[Wall pass benchmarks](https://www.ritfitsports.com/blogs/article/how-to-improve-soccer-passing) · "
-            "[Pro passing accuracy data](https://www.sportmonks.com/glossary/passing-accuracy/)"
-        )
-    passing_in = st.sidebar.slider("Short Passing Accuracy", 30, 99, 72)
-
-    with st.sidebar.expander("❓ How do I rate my Ball Control?"):
-        st.markdown(
-            "**Objective anchor — cone weave / juggling.** Weave a ball "
-            "through 5-6 cones 5 yards apart using both feet, staying "
-            "tight, OR count how many consecutive juggles you can do "
-            "without the ball hitting the ground.\n\n"
-            "- **10+ seconds through cones / under 10 juggles** → rate **30-45**\n"
-            "- **8-10 sec / 10-20 juggles** → rate **45-60**\n"
-            "- **Under 8 sec, tight touches / 20-50 juggles** → rate **60-75**\n"
-            "- **Fast + tight, comfortable both feet / 50+ juggles** → rate **75-90**\n\n"
-            "[Cone drill benchmarks](https://goalnyx.com/soccer-cone-drills-for-ball-control/)"
-        )
-    ballcontrol_in = st.sidebar.slider("Ball Control", 30, 99, 70)
-
-    with st.sidebar.expander("❓ How do I rate my Vision?"):
-        st.markdown(
-            "Vision is harder to self-time, so use this self-assessment "
-            "checklist instead — count how many describe you honestly:\n\n"
-            "- I scan over my shoulder *before* receiving the ball, not after\n"
-            "- I regularly spot a teammate in space that others miss\n"
-            "- I can complete a first-time pass into a teammate's stride without looking twice\n"
-            "- Coaches/teammates have specifically praised my passing choices, not just my technique\n"
-            "- I rarely give the ball away because I passed into a bad situation\n\n"
-            "**0-1 true** → rate **30-50** · **2-3 true** → rate **50-70** · "
-            "**4 true** → rate **70-85** · **5 true, consistently** → rate **85+**\n\n"
-            "[Scanning & passing vision research](https://www.mdpi.com/2673-7078/5/3/61)"
-        )
-    vision_in = st.sidebar.slider("Vision", 30, 99, 70)
-
-    with st.sidebar.expander("❓ How do I rate my Dribbling?"):
-        st.markdown(
-            "**Objective anchor — cone weave drill.** Set up 5-6 cones "
-            "5 yards apart, weave through with both feet, staying tight "
-            "under simulated pressure.\n\n"
-            "- **12-15+ sec, frequent loss of control** → rate **30-45**\n"
-            "- **8-10 sec, occasional wide touches** → rate **45-60**\n"
-            "- **Under 8 sec, tight touches, comfortable both feet** → rate **60-75**\n"
-            "- **Fast, tight, retains possession under real pressure in games** → rate **75-90**\n\n"
-            "[Cone drill benchmarks](https://goalnyx.com/soccer-cone-drills-for-ball-control/)"
-        )
-    dribbling_in = st.sidebar.slider("Dribbling", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Crossing?"):
-        st.markdown(
-            "**Objective anchor:** deliver 10 crosses/switches of play "
-            "into the box or to a target zone from a wide or deep "
-            "position.\n\n"
-            "- **0-2/10 reach the target zone** → rate **30-50**\n"
-            "- **3-5/10** → rate **50-65**\n"
-            "- **6-8/10, consistent delivery** → rate **65-80**\n"
-            "- **9-10/10, reliably picks out a specific target** → rate **80+**"
-        )
-    crossing_in = st.sidebar.slider("Crossing", 30, 99, 55)
-
-    with st.sidebar.expander("❓ How do I rate my Curve?"):
-        st.markdown(
-            "**Objective anchor:** try to bend 10 long passes or shots "
-            "around an obstacle placed between you and the target, "
-            "landing on target.\n\n"
-            "- **0-2/10 successfully bent on target** → rate **30-50**\n"
-            "- **3-5/10** → rate **50-65**\n"
-            "- **6-8/10, reliable curl on passes/shots** → rate **65-80**\n"
-            "- **9-10/10, can consistently shape the ball around obstacles** → rate **80+**"
-        )
-    curve_in = st.sidebar.slider("Curve", 30, 99, 55)
-
-    with st.sidebar.expander("❓ How do I rate my Free Kick Accuracy?"):
-        st.markdown(
-            "**Objective anchor:** take 10 direct free kicks from "
-            "18-25 yards at a goal (use a wall of cones/bags to "
-            "simulate a defensive wall if possible).\n\n"
-            "- **0-2/10 on target** → rate **30-50**\n"
-            "- **3-5/10** → rate **50-65**\n"
-            "- **6-8/10, consistent placement over/around a wall** → rate **65-80**\n"
-            "- **9-10/10, genuine set-piece threat** → rate **80+**"
-        )
-    freekickaccuracy_in = st.sidebar.slider("Free Kick Accuracy", 30, 99, 55)
-
-    with st.sidebar.expander("❓ How do I rate my Composure?"):
-        st.markdown(
-            "Composure is decision-making quality under pressure — use "
-            "this checklist honestly based on recent real games:\n\n"
-            "- I take my first touch calmly even when closed down immediately\n"
-            "- I rarely panic-clear or panic-pass under pressure\n"
-            "- I can slow the game down when needed instead of always rushing\n"
-            "- My decision quality doesn't drop late in games when tired\n"
-            "- I stay level-headed after a mistake instead of it affecting my next few plays\n\n"
-            "**0-1 true** → rate **30-50** · **2-3 true** → rate **50-70** · "
-            "**4-5 true, consistently** → rate **70-90**"
-        )
-    composure_in = st.sidebar.slider("Composure", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Stamina?"):
-        st.markdown(
-            "**Objective anchor — beep test (multi-stage fitness "
-            "test).** Run the standard 20m shuttle beep test and note "
-            "the level you reach before you can no longer keep pace.\n\n"
-            "- **Level 6-8** → rate **30-50**\n"
-            "- **Level 9-10 (solid recreational/amateur fitness)** → rate **50-65**\n"
-            "- **Level 11-13 (strong amateur/college level)** → rate **65-80**\n"
-            "- **Level 14+ (elite outfield range; pro midfielders often "
-            "score highest of any position)** → rate **80+**\n\n"
-            "[Beep test standards by level](https://peakvo2trainer.com/blog/beep-test-soccer/) · "
-            "[Age/position benchmarks](https://www.thebeeptest.com/sports/football)"
-        )
-    stamina_in = st.sidebar.slider("Stamina", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Long Shots?"):
-        st.markdown(
-            "**Objective anchor:** take 10 shots from 25+ yards at a "
-            "goal or wall target, counting how many stay on target.\n\n"
-            "- **0-2/10 on target** → rate **30-45**\n"
-            "- **3-5/10 on target** → rate **45-65**\n"
-            "- **6-8/10 on target** → rate **65-80**\n"
-            "- **9-10/10, genuine threat from distance** → rate **80+**"
-        )
-    longshots_in = st.sidebar.slider("Long Shots", 30, 99, 55)
-
-elif position == "Defender":
-    with st.sidebar.expander("❓ How do I rate my Standing Tackle?"):
-        st.markdown(
-            "**Objective anchor — tackle success rate.** Over your next "
-            "few practice games or 1v1 defending drills, track: "
-            "attempted standing tackles vs. tackles won cleanly (no foul, "
-            "ball recovered).\n\n"
-            "- **Under 40% win rate** → rate **30-50**\n"
-            "- **40-55% win rate** → rate **50-65**\n"
-            "- **55-70% win rate** → rate **65-80**\n"
-            "- **70%+ win rate (matches pro top-flight average)** → rate **80+**\n\n"
-            "Pros in top leagues average roughly **60-65% tackle success**, "
-            "with **70%+ considered excellent** — use that as your ceiling "
-            "reference, not your floor.\n\n"
-            "[Tackle success benchmarks](https://www.athletepath.com/soccer-tackle-success-rate-calculator/)"
-        )
-    standingtackle_in = st.sidebar.slider("Standing Tackle", 30, 99, 70)
-
-    with st.sidebar.expander("❓ How do I rate my Sliding Tackle?"):
-        st.markdown(
-            "Same logic as standing tackle, but specifically for slide "
-            "challenges: track attempted slide tackles vs. clean wins "
-            "(ball won, no foul, you recover quickly afterward).\n\n"
-            "- **Frequently mistimed/fouls** → rate **30-50**\n"
-            "- **Sometimes clean, sometimes late** → rate **50-65**\n"
-            "- **Mostly clean and well-timed** → rate **65-80**\n"
-            "- **Consistently clean, good recovery afterward** → rate **80+**\n\n"
-            "Note: many modern top defenders intentionally slide-tackle "
-            "*less* than older generations (higher foul/injury risk), so "
-            "don't assume a low attempt count means a low rating — "
-            "judge purely on success rate when you do commit."
-        )
-    slidingtackle_in = st.sidebar.slider("Sliding Tackle", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Interceptions?"):
-        st.markdown(
-            "Track how often you read a pass and step in front of it "
-            "*before* it reaches its target, across a few games.\n\n"
-            "- **Rarely anticipate passes** → rate **30-50**\n"
-            "- **Occasionally read the play, 1-2 real interceptions per game** → rate **50-70**\n"
-            "- **Regularly reading passing lanes, 2-3+ per game** → rate **70-85**\n"
-            "- **Elite anticipation, routinely cuts out attacks before they develop** → rate **85+**\n\n"
-            "Professional defenders average roughly **1-3 interceptions "
-            "per match** as a baseline reference.\n\n"
-            "[Defender metric benchmarks](https://thepfsa.co.uk/10-essential-football-metrics-you-should-know/)"
-        )
-    interceptions_in = st.sidebar.slider("Interceptions", 30, 99, 68)
-
-    with st.sidebar.expander("❓ How do I rate my Physicality?"):
-        st.markdown(
-            "This combines your strength (reuse your bench press result "
-            "above) with aggression/duel-winning — how you fare in "
-            "physical, shoulder-to-shoulder and aerial contests.\n\n"
-            "- **Consistently loses physical duels/out-muscled** → rate **30-50**\n"
-            "- **Competitive but inconsistent in duels** → rate **50-70**\n"
-            "- **Wins most 50/50s and aerial duels** → rate **70-85**\n"
-            "- **Dominant physically, rarely beaten in a duel** → rate **85+**"
-        )
-    physical_in = st.sidebar.slider("Physical / Duel Strength", 30, 99, 68)
-
-    with st.sidebar.expander("❓ How do I rate my Defensive Awareness?"):
-        st.markdown(
-            "This is about positioning and reading the game rather than "
-            "any single physical action — use this checklist from "
-            "recent real games:\n\n"
-            "- I rarely get caught out of position or beaten for pace on the last line\n"
-            "- I recognize danger and adjust my position before the ball arrives, not after\n"
-            "- I communicate and organize teammates around me\n"
-            "- I rarely commit to a challenge I don't need to make\n"
-            "- Coaches trust me in high-pressure defensive moments\n\n"
-            "**0-1 true** → rate **30-50** · **2-3 true** → rate **50-70** · "
-            "**4-5 true, consistently** → rate **70-90**"
-        )
-    defensiveawareness_in = st.sidebar.slider("Defensive Awareness", 30, 99, 68)
-
-    with st.sidebar.expander("❓ How do I rate my Heading Accuracy?"):
-        st.markdown(
-            "**Objective anchor — aerial duel win rate.** Over a few "
-            "games or set-piece defending drills, track contested "
-            "headers won vs. attempted (both defending crosses and "
-            "clearing set pieces).\n\n"
-            "- **Under 40% win rate** → rate **30-50**\n"
-            "- **40-55% win rate** → rate **50-65**\n"
-            "- **55-70% win rate** → rate **65-80**\n"
-            "- **70%+ win rate (above pro top-flight average of ~66%)** → rate **80+**\n\n"
-            "[Aerial duel benchmarks](https://www.athletepath.com/soccer-aerial-duel-calculator/)"
-        )
-    headingaccuracy_in = st.sidebar.slider("Heading Accuracy", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Jumping?"):
-        st.markdown(
-            "**Objective anchor — standing vertical jump.** Stand flat "
-            "next to a wall, mark your standing reach, jump straight up "
-            "and mark your peak reach. The difference is your vertical "
-            "jump.\n\n"
-            "- **Under 14 inches** → rate **30-50**\n"
-            "- **14-18 inches (average adult male range)** → rate **50-65**\n"
-            "- **18-24 inches (good athletic level)** → rate **65-80**\n"
-            "- **24+ inches (strong athletic level for a field-sport athlete)** → rate **80+**\n\n"
-            "[Vertical jump norms](https://www.topendsports.com/testing/norms/vertical-jump.htm)"
-        )
-    jumping_in = st.sidebar.slider("Jumping", 30, 99, 60)
-
-    with st.sidebar.expander("❓ How do I rate my Composure?"):
-        st.markdown(
-            "For a defender, composure mostly shows up in how you "
-            "handle pressure near your own goal — use this checklist:\n\n"
-            "- I can take a calm first touch under pressure in my own box\n"
-            "- I don't panic-clear the ball when I have time to play out\n"
-            "- A mistake doesn't rattle my next few defensive actions\n"
-            "- I stay calm and communicate even when the team is under sustained pressure\n"
-            "- I make good decisions in the last few minutes of close games\n\n"
-            "**0-1 true** → rate **30-50** · **2-3 true** → rate **50-70** · "
-            "**4-5 true, consistently** → rate **70-90**"
-        )
-    composure_in = st.sidebar.slider("Composure", 30, 99, 65)
-
-    with st.sidebar.expander("❓ How do I rate my Build-Up Passing?"):
-        st.markdown(
-            "Modern defenders are expected to play out from the back, "
-            "not just clear the ball. **Objective anchor — wall pass "
-            "test:** 100 total attempts (50 per foot) against a wall, "
-            "count clean returns, same as a midfielder's passing test.\n\n"
-            "- **Under 50/100 clean** → rate **30-45**\n"
-            "- **50-70/100 clean** → rate **45-60**\n"
-            "- **70-85/100 clean** → rate **60-75**\n"
-            "- **85+/100 clean, comfortable playing out under pressure** → rate **75+**\n\n"
-            "[Wall pass benchmarks](https://www.ritfitsports.com/blogs/article/how-to-improve-soccer-passing)"
-        )
-    passing_in = st.sidebar.slider("Build-Up Passing", 30, 99, 60)
-
+ 
+ensure_database_ready()
+init_users_table()
+init_state()
+ 
+# Someone who already signed up in this session never sees the sign-up page again.
+if st.session_state.page == "welcome" and st.session_state.signed_up:
+    st.session_state.page = "form"
+ 
+if st.session_state.page == "welcome":
+    render_welcome()
+elif st.session_state.page == "form":
+    render_form()
 else:
-    st.sidebar.info("Select a position above to see position-specific technical ratings.")
-
-# Start every feature at the position-specific baseline mean (not the whole
-# population), so attributes we don't directly test still reflect a realistic
-# player at that position rather than a generic average.
-position_map = {"Forward": "ST", "Midfielder": "CM", "Defender": "CB"}
-df_position = df_baseline[df_baseline.get("position", pd.Series(dtype=str)) == position_map.get(position, "")]
-if df_position.empty:
-    df_position = df_baseline  # fallback if position labels don't match the DB
-
-input_dict = {col: float(df_position[col].mean()) for col in feature_cols}
-
-
-def clamp(value, lo=30.0, hi=99.0):
-    return max(lo, min(hi, value))
-
-
-def rating_from_time(seconds, best_time, worst_time):
-    """Faster (lower) time -> higher rating. Linearly interpolates between
-    a recreational-level time (worst_time -> 30) and an elite time
-    (best_time -> 99)."""
-    span = worst_time - best_time
-    scaled = 99.0 - (seconds - best_time) * (69.0 / span)
-    return clamp(scaled)
-
-
-def rating_from_reps(reps, min_reps, max_reps):
-    span = max_reps - min_reps
-    scaled = 30.0 + (reps - min_reps) * (69.0 / span)
-    return clamp(scaled)
-
-
-# --- Profile inputs -> feature columns ------------------------------------
-# Note: "age" isn't in feature_columns.json, so the trained model has no
-# slot for it. We still collect it for display/context, but it can't
-# influence the prediction unless the model gets retrained with age added
-# to its feature set.
-if 'height' in input_dict:
-    input_dict['height'] = float(height_in)
-if 'weight' in input_dict:
-    input_dict['weight'] = float(weight_in)
-if 'weakfootability' in input_dict:
-    input_dict['weakfootability'] = float(weakfoot_in)
-if 'skillmoves' in input_dict:
-    input_dict['skillmoves'] = float(skillmoves_in)
-
-# --- Physical test inputs -> feature columns -----------------------------
-# 30m sprint: elite ~3.5s, recreational ~6.0s
-sprint_rating = rating_from_time(sprint_time, best_time=3.5, worst_time=6.0)
-# 5-10-5 shuttle: elite ~4.0s, recreational ~7.0s (agility/change of direction)
-shuttle_rating = rating_from_time(shuttle_time, best_time=4.0, worst_time=7.0)
-# Bench press reps at 135lbs: 0-30 reps mapped to strength
-strength_rating = rating_from_reps(bench_reps, min_reps=0, max_reps=30)
-
-for col in ("acceleration", "sprintspeed"):
-    if col in input_dict:
-        input_dict[col] = sprint_rating
-for col in ("agility", "balance", "reactions"):
-    if col in input_dict:
-        input_dict[col] = shuttle_rating
-for col in ("strength",):
-    if col in input_dict:
-        input_dict[col] = strength_rating
-
-# --- Technical rating inputs -> feature columns ---------------------------
-# Only override attributes actually shown for the selected position; every
-# other attribute stays at the position-average baseline set above.
-if finishing_in is not None and 'finishing' in input_dict:
-    input_dict['finishing'] = float(finishing_in)
-if shotpower_in is not None:
-    for col in ('shotpower', 'volleys'):
-        if col in input_dict:
-            input_dict[col] = float(shotpower_in)
-
-if passing_in is not None:
-    for col in ('shortpassing', 'longpassing'):
-        if col in input_dict:
-            input_dict[col] = float(passing_in)
-if ballcontrol_in is not None and 'ballcontrol' in input_dict:
-    input_dict['ballcontrol'] = float(ballcontrol_in)
-if vision_in is not None and 'vision' in input_dict:
-    input_dict['vision'] = float(vision_in)
-
-if standingtackle_in is not None and 'standingtackle' in input_dict:
-    input_dict['standingtackle'] = float(standingtackle_in)
-if slidingtackle_in is not None and 'slidingtackle' in input_dict:
-    input_dict['slidingtackle'] = float(slidingtackle_in)
-if interceptions_in is not None and 'interceptions' in input_dict:
-    input_dict['interceptions'] = float(interceptions_in)
-if physical_in is not None:
-    for col in ('strength', 'aggression'):
-        if col in input_dict:
-            input_dict[col] = float(physical_in)
-
-if dribbling_in is not None and 'dribbling' in input_dict:
-    input_dict['dribbling'] = float(dribbling_in)
-if longshots_in is not None and 'longshots' in input_dict:
-    input_dict['longshots'] = float(longshots_in)
-if positioning_in is not None and 'positioning' in input_dict:
-    input_dict['positioning'] = float(positioning_in)
-if headingaccuracy_in is not None and 'headingaccuracy' in input_dict:
-    input_dict['headingaccuracy'] = float(headingaccuracy_in)
-if curve_in is not None and 'curve' in input_dict:
-    input_dict['curve'] = float(curve_in)
-if penalties_in is not None and 'penalties' in input_dict:
-    input_dict['penalties'] = float(penalties_in)
-if crossing_in is not None and 'crossing' in input_dict:
-    input_dict['crossing'] = float(crossing_in)
-if freekickaccuracy_in is not None and 'freekickaccuracy' in input_dict:
-    input_dict['freekickaccuracy'] = float(freekickaccuracy_in)
-if composure_in is not None and 'composure' in input_dict:
-    input_dict['composure'] = float(composure_in)
-if stamina_in is not None and 'stamina' in input_dict:
-    input_dict['stamina'] = float(stamina_in)
-if jumping_in is not None and 'jumping' in input_dict:
-    input_dict['jumping'] = float(jumping_in)
-if defensiveawareness_in is not None and 'defensiveawareness' in input_dict:
-    input_dict['defensiveawareness'] = float(defensiveawareness_in)
-
-# --- Recompute the aggregate category columns so they stay consistent with
-#     the detail columns we just changed above (these composites exist in
-#     the EA-style schema and should never contradict their sub-attributes).
-composite_sources = {
-    "pac": ["acceleration", "sprintspeed"],
-    "dri": ["dribbling", "ballcontrol", "agility", "balance"],
-    "pas": ["shortpassing", "longpassing", "vision"],
-    "sho": ["finishing", "shotpower", "volleys", "longshots", "penalties"],
-    "def": ["standingtackle", "slidingtackle", "interceptions", "defensiveawareness"],
-    "phy": ["strength", "stamina", "aggression", "jumping"],
-}
-for composite_col, source_cols in composite_sources.items():
-    present_sources = [c for c in source_cols if c in input_dict]
-    if composite_col in input_dict and present_sources:
-        input_dict[composite_col] = float(np.mean([input_dict[c] for c in present_sources]))
-
-input_df = pd.DataFrame([input_dict])[feature_cols]
-
-# Model Prediction
-predicted_rating = float(model.predict(input_df)[0])
-
-# Dashboard View
-col1, col2, col3 = st.columns(3)
-
-with col1:
-    st.metric("Player Name", player_name)
-    st.metric("Position", position)
-    st.metric("Age", age_in)
-
-with col2:
-    st.metric("Predicted Talent Rating", f"{predicted_rating:.1f} / 99")
-
-with col3:
-    st.metric("Calculated Pace Rating", f"{input_dict.get('pac', sprint_rating):.1f}")
-
-st.divider()
-st.write(f"### Your Standing vs. Pro {position}s (Z-Score Comparison)")
-st.caption(
-    "A Z-score shows how many standard deviations above or below the "
-    "position average you fall. 0 = exactly average for the position, "
-    "+1 = one std. dev. above average, -1 = one std. dev. below."
-)
-
-zscore_features = {
-    "Overall (Predicted)": ("overallrating", predicted_rating),
-    "Pace": ("pac", input_dict.get("pac")),
-    "Dribbling": ("dri", input_dict.get("dri")),
-    "Passing": ("pas", input_dict.get("pas")),
-    "Shooting": ("sho", input_dict.get("sho")),
-    "Defending": ("def", input_dict.get("def")),
-    "Physical": ("phy", input_dict.get("phy")),
-    "Height (cm)": ("height", input_dict.get("height")),
-    "Weight (kg)": ("weight", input_dict.get("weight")),
-}
-
-zscore_rows = []
-for label, (col, user_value) in zscore_features.items():
-    if col not in df_position.columns or user_value is None:
-        continue
-    pos_mean = df_position[col].mean()
-    pos_std = df_position[col].std()
-    z = (user_value - pos_mean) / pos_std if pos_std > 0 else 0.0
-    zscore_rows.append({"Attribute": label, "Your Value": round(user_value, 1), "Position Avg": round(pos_mean, 1), "Z-Score": round(z, 2)})
-
-zscore_df = pd.DataFrame(zscore_rows).set_index("Attribute")
-col_z1, col_z2 = st.columns([2, 1])
-with col_z1:
-    st.bar_chart(zscore_df["Z-Score"])
-with col_z2:
-    st.dataframe(zscore_df)
-
-st.divider()
-st.write("### Benchmark Comparison Against 16,228 Professional Records")
-
-col_a, col_b = st.columns(2)
-with col_a:
-    st.write("**Database Overall Rating Distribution**")
-    st.bar_chart(df_baseline['overallrating'].value_counts().sort_index())
-
-with col_b:
-    st.write(f"**{position} Position Baselines (n={len(df_position)})**")
-    st.dataframe(df_position[['overallrating', 'height', 'weight']].describe().T[['mean', 'std', 'min', 'max']])
+    if not st.session_state.answers.get("position"):
+        goto("form")
+    render_results()
+ 
