@@ -233,7 +233,7 @@ def build_input_row(answers, position, df_position, feature_cols):
 # ---------------------------------------------------------------------------
 CSS = """
 <style>
-.block-container { padding-top: 2.2rem; max-width: 760px; }
+.block-container { padding-top: 6.5rem; max-width: 760px; }
 .eyebrow { color:#4ade80; font-size:0.78rem; letter-spacing:0.12em; text-transform:uppercase; font-weight:600; }
 .hero-title { font-size:2.5rem; font-weight:800; line-height:1.1; margin:0.2rem 0 0.6rem 0; }
 .hero-sub { color:#b6d4c1; font-size:1.05rem; margin-bottom:1.2rem; }
